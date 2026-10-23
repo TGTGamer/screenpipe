@@ -16,6 +16,8 @@ mod linux;
 mod linux_portal;
 #[cfg(target_os = "linux")]
 mod linux_portal_token;
+#[cfg(target_os = "linux")]
+pub use linux_portal::set_stream_release_delay;
 #[cfg(any(target_os = "linux", test))]
 mod linux_wayland;
 #[cfg(target_os = "macos")]

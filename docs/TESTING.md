@@ -116,6 +116,7 @@ commits: `28e5c247`
 - [ ] **Linux Wayland: portal approval survives restart** - On KDE Plasma or GNOME (Wayland) with 2+ monitors, start screenpipe with no `~/.screenpipe/wayland-screencast-restore-token`, pick each monitor individually in the share dialog. Log shows `Wayland portal capture started for N monitor(s)` and the token file exists with mode `0600`. Quit and relaunch (and log out and in): no dialog appears and capture starts again.
 - [ ] **Linux Wayland: unusable selection re-prompts** - Delete the token file, start screenpipe, and pick "Share full Workspace" on KDE. Log shows `pick individual screens (not the full workspace)`, the token file is removed, and the next retry (about 60s) shows the dialog again instead of failing silently every minute.
 - [ ] **Linux Wayland: identical monitors map by connector** - With 2+ monitors of the same resolution on KDE, each screen's frames land on the matching monitor in the timeline (portal `mapping_id`, for example `HDMI-A-1`, is matched to the monitor name).
+- [ ] **Linux Wayland (KDE): screen-casting tray item stays put** - While recording on Plasma Wayland, `dbus-monitor --session "type='signal',interface='org.kde.StatusNotifierWatcher'"` shows the portal's "Screen casting" item registered once, not re-registered per frame, and the tray does not reflow. It disappears about 30 s after the last capture on a monitor (stream release is deferred by that idle window).
 
 ### 4. audio device handling
 

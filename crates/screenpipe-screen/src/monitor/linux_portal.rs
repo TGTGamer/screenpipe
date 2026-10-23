@@ -48,6 +48,24 @@ const PORTAL_RUNNING: u8 = 2;
 const PORTAL_FAILED: u8 = 3;
 const PORTAL_RETRY_DELAY: Duration = Duration::from_secs(60);
 pub(super) const PORTAL_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long a monitor's PipeWire stream stays active after its last capture
+/// request ends, in milliseconds. Toggling the stream around every frame made
+/// KDE's portal register and remove its "Screen casting" tray item per frame,
+/// so the whole tray reflowed several times a second. Keeping the stream
+/// active across the capture cadence (0.5 fps on change, 30 s idle sweeps)
+/// leaves the indicator steady while recording and releases the stream once
+/// a monitor has really gone idle.
+static STREAM_RELEASE_DELAY_MS: AtomicU64 = AtomicU64::new(30_000);
+
+/// Overrides how long a stream stays active after its last capture; zero
+/// restores the old release-per-frame behaviour.
+pub fn set_stream_release_delay(delay: Duration) {
+    STREAM_RELEASE_DELAY_MS.store(delay.as_millis() as u64, Ordering::Relaxed);
+}
+
+fn stream_release_delay() -> Duration {
+    Duration::from_millis(STREAM_RELEASE_DELAY_MS.load(Ordering::Relaxed))
+}
 /// Ask the portal to keep the approval until the user revokes it, so the
 /// restore token survives app restarts and logins. `Application` (the old
 /// value) only lasts while screenpipe runs, which re-prompted every boot.
@@ -113,6 +131,9 @@ struct PortalShared {
     monitors: Mutex<HashMap<u32, MonitorDescriptor>>,
     node_by_monitor: Mutex<HashMap<u32, u32>>,
     active_requests: Mutex<HashMap<u32, usize>>,
+    /// Per monitor, the epoch of the latest capture begin/end; a deferred
+    /// stream release only fires if its epoch is still current.
+    release_epochs: Mutex<HashMap<u32, u64>>,
     frames: Mutex<HashMap<u32, PortalFrame>>,
     frame_ready: Condvar,
     control: Mutex<Option<ActiveControl>>,
@@ -149,6 +170,7 @@ impl PortalShared {
             monitors: Mutex::new(HashMap::new()),
             node_by_monitor: Mutex::new(HashMap::new()),
             active_requests: Mutex::new(HashMap::new()),
+            release_epochs: Mutex::new(HashMap::new()),
             frames: Mutex::new(HashMap::new()),
             frame_ready: Condvar::new(),
             control: Mutex::new(None),
@@ -216,6 +238,48 @@ impl Drop for PortalCaptureRequest {
             session.end_capture(self.monitor_id);
         }
     }
+}
+
+fn set_monitor_active_on(shared: &PortalShared, monitor_id: u32, active: bool) {
+    let node_id = shared
+        .node_by_monitor
+        .lock()
+        .unwrap()
+        .get(&monitor_id)
+        .copied();
+    let control = shared.control.lock().unwrap().clone();
+    if let (Some(node_id), Some(control)) = (node_id, control) {
+        if control.generation == shared.generation.load(Ordering::Acquire) {
+            let _ = control
+                .sender
+                .send(PortalControl::SetActive { node_id, active });
+        }
+    }
+}
+
+/// Marks a new capture begin or end for the monitor and returns its epoch.
+fn bump_release_epoch(shared: &PortalShared, monitor_id: u32) -> u64 {
+    let mut epochs = shared.release_epochs.lock().unwrap();
+    let epoch = epochs.get(&monitor_id).copied().unwrap_or(0) + 1;
+    epochs.insert(monitor_id, epoch);
+    epoch
+}
+
+/// True when the monitor has no capture request and nothing began or ended
+/// since the end that armed `epoch`.
+fn release_due(shared: &PortalShared, monitor_id: u32, epoch: u64) -> bool {
+    let busy = shared
+        .active_requests
+        .lock()
+        .unwrap()
+        .contains_key(&monitor_id);
+    let current = shared
+        .release_epochs
+        .lock()
+        .unwrap()
+        .get(&monitor_id)
+        .copied();
+    !busy && current == Some(epoch)
 }
 
 pub(super) fn shared_portal_capture() -> Arc<PortalCaptureSession> {
@@ -309,6 +373,7 @@ impl PortalCaptureSession {
             .unwrap()
             .entry(monitor_id)
             .or_default() += 1;
+        bump_release_epoch(&self.shared, monitor_id);
 
         if let Err(error) = self.ensure_started() {
             self.end_capture(monitor_id);
@@ -387,6 +452,7 @@ impl PortalCaptureSession {
             .lock()
             .unwrap()
             .remove(&monitor_id);
+        bump_release_epoch(&self.shared, monitor_id);
         self.set_monitor_active(monitor_id, false);
         self.shared.frames.lock().unwrap().remove(&monitor_id);
         self.shared.frame_ready.notify_all();
@@ -477,26 +543,36 @@ impl PortalCaptureSession {
             }
         };
         if should_pause {
-            self.set_monitor_active(monitor_id, false);
+            self.schedule_stream_release(monitor_id);
         }
     }
 
-    fn set_monitor_active(&self, monitor_id: u32, active: bool) {
-        let node_id = self
-            .shared
-            .node_by_monitor
-            .lock()
-            .unwrap()
-            .get(&monitor_id)
-            .copied();
-        let control = self.shared.control.lock().unwrap().clone();
-        if let (Some(node_id), Some(control)) = (node_id, control) {
-            if control.generation == self.shared.generation.load(Ordering::Acquire) {
-                let _ = control
-                    .sender
-                    .send(PortalControl::SetActive { node_id, active });
+    /// Releases the monitor's stream once `stream_release_delay()` has passed
+    /// without a new capture request. Without a Tokio runtime, or with a zero
+    /// delay, the stream is released immediately as before.
+    fn schedule_stream_release(&self, monitor_id: u32) {
+        let epoch = bump_release_epoch(&self.shared, monitor_id);
+        let delay = stream_release_delay();
+        let handle = if delay.is_zero() {
+            None
+        } else {
+            tokio::runtime::Handle::try_current().ok()
+        };
+        let Some(handle) = handle else {
+            set_monitor_active_on(&self.shared, monitor_id, false);
+            return;
+        };
+        let shared = self.shared.clone();
+        handle.spawn(async move {
+            tokio::time::sleep(delay).await;
+            if release_due(&shared, monitor_id, epoch) {
+                set_monitor_active_on(&shared, monitor_id, false);
             }
-        }
+        });
+    }
+
+    fn set_monitor_active(&self, monitor_id: u32, active: bool) {
+        set_monitor_active_on(&self.shared, monitor_id, active);
     }
 
     fn invalidate_current(&self) {
@@ -1361,6 +1437,41 @@ mod tests {
             stream_match_score(&monitors[1], &conflicting)
                 > stream_match_score(&monitors[0], &conflicting)
         );
+    }
+
+    #[test]
+    fn deferred_stream_release_only_fires_for_the_latest_idle_period() {
+        let shared = PortalShared::empty();
+        let armed = bump_release_epoch(&shared, 7);
+        assert!(release_due(&shared, 7, armed), "idle monitor releases");
+
+        // A capture request arriving inside the window cancels the release.
+        *shared.active_requests.lock().unwrap().entry(7).or_default() += 1;
+        bump_release_epoch(&shared, 7);
+        assert!(
+            !release_due(&shared, 7, armed),
+            "busy monitor keeps its stream"
+        );
+
+        // The request ends: only the timer armed by that end may release.
+        shared.active_requests.lock().unwrap().remove(&7);
+        let rearmed = bump_release_epoch(&shared, 7);
+        assert!(
+            !release_due(&shared, 7, armed),
+            "superseded timer never fires"
+        );
+        assert!(release_due(&shared, 7, rearmed));
+
+        // Other monitors are independent.
+        assert!(!release_due(&shared, 8, rearmed));
+    }
+
+    #[test]
+    fn stream_release_delay_defaults_to_the_idle_window_and_can_be_overridden() {
+        assert_eq!(stream_release_delay(), Duration::from_secs(30));
+        set_stream_release_delay(Duration::from_millis(5));
+        assert_eq!(stream_release_delay(), Duration::from_millis(5));
+        set_stream_release_delay(Duration::from_secs(30));
     }
 
     #[test]
