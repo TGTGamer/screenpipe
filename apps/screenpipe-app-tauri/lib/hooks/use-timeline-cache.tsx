@@ -43,7 +43,12 @@ export function shouldRestrictTimelineHistory(
   user: AppUser | null | undefined,
   isEnterpriseBuild: boolean,
 ): boolean {
-  return !isEnterpriseBuild && isFreeOrUnattributedUser(user);
+  // Fork-only: local history is never time-limited in this build. Upstream
+  // restricts free and unattributed consumer accounts to the last 24 hours
+  // here as well as in the engine; both gates are off in this fork.
+  void user;
+  void isEnterpriseBuild;
+  return false;
 }
 
 export function useAuthoritativeTimelineHistoryAccess(

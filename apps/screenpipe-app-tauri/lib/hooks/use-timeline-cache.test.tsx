@@ -145,9 +145,9 @@ describe("timeline cache history access", () => {
     ).toBe(frames);
   });
 
-  it("fails closed for unknown consumer accounts but never restricts enterprise builds", () => {
+  it("never restricts local history on this fork, whatever the account or build", () => {
     expect(shouldRestrictTimelineHistory(undefined, true)).toBe(false);
-    expect(shouldRestrictTimelineHistory(undefined, false)).toBe(true);
+    expect(shouldRestrictTimelineHistory(undefined, false)).toBe(false);
     expect(shouldRestrictTimelineHistory(paidUser(nowMs), false)).toBe(false);
   });
 
