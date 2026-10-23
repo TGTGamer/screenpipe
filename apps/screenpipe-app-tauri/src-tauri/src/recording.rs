@@ -416,7 +416,12 @@ pub(crate) fn refresh_history_access_policy(
 }
 
 fn history_access_restricted(is_enterprise_build: bool, free_or_unattributed: bool) -> bool {
-    !is_enterprise_build && free_or_unattributed
+    // Fork-only: local history is never time-limited here. Upstream restricts
+    // free and unattributed consumer accounts to the last 24 hours
+    // (`FREE_HISTORY_HOURS`); this build keeps every locally recorded day
+    // reachable from the timeline, search and raw SQL.
+    let _ = (is_enterprise_build, free_or_unattributed);
+    false
 }
 
 fn capture_intended_now(wants_recording: &AtomicBool) -> bool {
@@ -2430,8 +2435,8 @@ mod history_access_tests {
     use super::history_access_restricted;
 
     #[test]
-    fn consumer_free_and_unattributed_accounts_are_restricted() {
-        assert!(history_access_restricted(false, true));
+    fn consumer_free_and_unattributed_accounts_keep_full_history_on_this_fork() {
+        assert!(!history_access_restricted(false, true));
     }
 
     #[test]

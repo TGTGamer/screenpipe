@@ -1214,10 +1214,9 @@ pub async fn set_cloud_token(
     if let Some(settings) = settings.as_ref() {
         crate::recording::refresh_history_access_policy(&state.history_access, settings);
     } else {
-        // Missing/corrupt settings are unattributed on consumer builds.
-        state
-            .history_access
-            .set_last_24_hours(!crate::app_mode::is_managed(&app));
+        // Fork-only: history stays unrestricted even when settings are
+        // missing or corrupt (upstream treats that as unattributed).
+        state.history_access.set_last_24_hours(false);
     }
     let pipe_manager = {
         let server = state.server.lock().await;
